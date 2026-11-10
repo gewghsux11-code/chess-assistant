@@ -41,11 +41,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "layout/Library/Application Support/Chess"
-          gh release download maia-model --repo "${{ github.repository }}" --pattern "maia3_5m.mlpackage.zip" --output model.zip
+          gh release download maia-model --repo epic0001/chess-assistant --pattern "*.mlpackage.zip" --output model.zip
           unzip -q model.zip -d "layout/Library/Application Support/Chess"
           chmod -R a+rX "layout/Library/Application Support/Chess"
           find "layout/Library/Application Support/Chess" -maxdepth 2 -print
-          MP="layout/Library/Application Support/Chess/maia3_5m.mlpackage"
+          MP=$(find "layout/Library/Application Support/Chess" -maxdepth 4 -name "*.mlpackage" -type d | head -1)
+          echo "model: $MP"
+          test -n "$MP"
           cp "$MP/Manifest.json" maia_mfst.json
           cp "$MP/Data/com.apple.CoreML/model.mlmodel" maia_model.bin
           cp "$MP/Data/com.apple.CoreML/weights/weight.bin" maia_wghts.bin
