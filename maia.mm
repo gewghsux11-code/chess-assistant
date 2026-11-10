@@ -268,7 +268,7 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
         std::sort(cands.begin(), cands.end(),
                   [](const Cand &a, const Cand &b) { return a.logit > b.logit; });
 
-        double T = 1.3;
+        double T = 0.5;
         double mx = cands[0].logit / T, sum = 0;
         for (auto &c : cands) sum += exp(c.logit / T - mx);
         for (auto &c : cands) c.prob = exp(c.logit / T - mx) / sum;
