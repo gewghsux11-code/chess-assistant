@@ -253,7 +253,7 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
         MLMultiArray *valueLogits = [out featureValueForName:@"value_logits"].multiArrayValue;
         if (!moveLogits) { if (done) done(res); return; }
 
-        struct Cand { double logit; std::string uci; };
+        struct Cand { double logit; std::string uci; double prob; };
         std::vector<Cand> cands;
         for (int i = 0; i < legalCount; i++) {
             std::string uci(&legalBuf[i * 6]);
@@ -268,15 +268,29 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
         std::sort(cands.begin(), cands.end(),
                   [](const Cand &a, const Cand &b) { return a.logit > b.logit; });
 
-        double mx = cands[0].logit, sum = 0;
-        for (auto &c : cands) sum += exp(c.logit - mx);
+        double T = 1.3;
+        double mx = cands[0].logit / T, sum = 0;
+        for (auto &c : cands) sum += exp(c.logit / T - mx);
+        for (auto &c : cands) c.prob = exp(c.logit / T - mx) / sum;
 
-        int n = (int)cands.size(); if (n > 4) n = 4;
+        int total = (int)cands.size();
+        int pick = 0;
+        if (total > 1) {
+            double r = (double)arc4random_uniform(1000000) / 1000000.0;
+            double acc = 0;
+            for (int i = 0; i < total; i++) {
+                acc += cands[i].prob;
+                if (r <= acc) { pick = i; break; }
+            }
+        }
+        if (pick > 0) std::rotate(cands.begin(), cands.begin() + pick, cands.begin() + pick + 1);
+
+        int n = total; if (n > 4) n = 4;
         res.count = n;
         for (int k = 0; k < n; k++) {
             std::strncpy(res.moves[k], cands[k].uci.c_str(), 7);
             res.moves[k][7] = '\0';
-            res.policy[k] = exp(cands[k].logit - mx) / sum;
+            res.policy[k] = cands[k].prob;
         }
         std::strncpy(res.move, cands[0].uci.c_str(), 7);
         res.move[7] = '\0';
