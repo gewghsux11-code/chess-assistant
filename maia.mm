@@ -341,9 +341,8 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
 
     // Temperature stays at 1.0 so the sampled distribution is the model's
     // own. Cold form loosens it slightly, openings a touch more.
-    double T = kTempScale * (1.0 + 0.15 * -gForm);
-    if (gPly <= 8) T = 1.15;
-    if (T < 0.05) T = 0.05;
+    double T = kTempScale;
+if (T < 0.05) T = 0.05;
 
     double mx = cands[0].logit, sum = 0;
     for (int i = 0; i < total; i++) {
