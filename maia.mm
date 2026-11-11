@@ -9,20 +9,24 @@
 #import <vector>
 #import <string>
 #import <unordered_map>
-#import <algorithm>
+#include <algorithm>
 
 // ---- strength settings ----
-static const int    kEloOffset   = 200;   // Maia/Lichess ratings run above chess.com
-static const double kTempMax     = 1.45;  // temperature at 600 elo
-static const double kTempMin     = 1.05;  // temperature at 2600 elo
-static const double kBlunderMax  = 0.18;  // deliberate-inaccuracy rate at 600 elo
-static const double kBlunderMin  = 0.06;  // deliberate-inaccuracy rate at 2600 elo
+// Elo is passed to the net as a raw integer and clamped to [0,5000] inside the
+// model. The offset is pure calibration between rating pools, nothing else.
+static const int kEloOffset = 100;
+static const double kTempScale = 1.0;   // 1.0 = the model's own distribution
+static const int kHistPlanes = 8;       // 8 frames x 12 planes = 96
 
-static double gForm = 0.0;                // -1 cold game .. +1 hot game
+#define MAIA_DEBUG_DIST 0
 
+static double gForm = 0.0;   // -1 cold game .. +1 hot game
+static int gPly = 0;         // plies seen this game, from the history ring
 static MLModel *gMaiaModel = nil;
 static std::vector<std::string> gMoves;
 static std::unordered_map<std::string, int> gMoveIdx;
+static std::vector<std::string> gHist;
+static bool gHaveRolled = false;
 
 static std::string squareName(int sq) {
     char s[3];
@@ -44,13 +48,15 @@ static void buildMoveTables(void) {
         for (int ft = 0; ft < 8; ft++)
             for (int p = 0; p < 4; p++) {
                 char s[6];
-                s[0] = 'a' + ff; s[1] = '7';
-                s[2] = 'a' + ft; s[3] = '8';
-                s[4] = pieces[p]; s[5] = '\0';
+                s[0] = 'a' + ff;
+                s[1] = '7';
+                s[2] = 'a' + ft;
+                s[3] = '8';
+                s[4] = pieces[p];
+                s[5] = '\0';
                 gMoves[idx++] = std::string(s);
             }
-    for (int i = 0; i < (int)gMoves.size(); i++)
-        gMoveIdx[gMoves[i]] = i;
+    for (int i = 0; i < (int)gMoves.size(); i++) gMoveIdx[gMoves[i]] = i;
 }
 
 static std::string mirrorUci(const std::string &u) {
@@ -78,21 +84,30 @@ static bool parseFenBoard(const char *fen, char board[64], int *sideBlack) {
     return true;
 }
 
-static int fenFullmove(const char *fen) {
-    const char *p = fen;
-    int spaces = 0;
-    while (*p && spaces < 5) { if (*p == ' ') spaces++; p++; }
-    int n = atoi(p);
-    return n > 0 ? n : 1;
+// Board field of the start position. Independent of how many FEN fields the
+// caller supplies, so a four-field FEN still works.
+static const char kStartBoard[] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+static bool isStartPos(const char *fen) {
+    return strncmp(fen, kStartBoard, sizeof(kStartBoard) - 1) == 0;
 }
 
-// Roll a fresh form value once per game, on the first suggestion request.
+// Roll a fresh form value once per game.
 static void maybeRollForm(const char *fen) {
-    static char last[128] = {0};
-    if (fenFullmove(fen) != 1) return;
-    if (strcmp(last, fen) == 0) return;
-    strncpy(last, fen, sizeof(last) - 1);
-    gForm = ((double)arc4random_uniform(1000) / 1000.0) * 2.0 - 1.0;
+    if (isStartPos(fen) && (!gHaveRolled || gHist.size() > 1)) {
+        gForm = ((double)arc4random_uniform(1000) / 1000.0) * 2.0 - 1.0;
+        gHaveRolled = true;
+        gHist.clear();
+        gPly = 0;
+    }
+}
+
+// Oldest first, newest last. Reset at the start of every game.
+static void pushHistory(const char *fen) {
+    if (isStartPos(fen)) { gHist.clear(); gPly = 0; }
+    if (!gHist.empty() && gHist.back() == fen) return;
+    gHist.push_back(fen);
+    if ((int)gHist.size() > kHistPlanes) gHist.erase(gHist.begin());
+    gPly++;
 }
 
 static int pieceType(char c) {
@@ -107,43 +122,40 @@ static int pieceType(char c) {
     return 0;
 }
 
+// The model concatenates history oldest-first along the channel axis, so the
+// newest position is the LAST frame. Short history pads the front with the
+// oldest available. Every frame is oriented from the side to move.
 static MLMultiArray *buildTokens(const char *fen, int sideBlack) {
-    char board[64];
-    int sb = 0;
-    parseFenBoard(fen, board, &sb);
-
-    float base[64 * 12];
-    for (int i = 0; i < 64 * 12; i++) base[i] = 0.0f;
-
-    for (int sq = 0; sq < 64; sq++) {
-        char c = board[sq];
-        if (!c) continue;
-        int t = pieceType(c);
-        if (!t) continue;
-        int isBlackPiece = (c >= 'a' && c <= 'z') ? 1 : 0;
-
-        int tsq, tcolorBlack;
-        if (sideBlack) {
-            tsq = sq ^ 56;
-            tcolorBlack = isBlackPiece ? 0 : 1;
-        } else {
-            tsq = sq;
-            tcolorBlack = isBlackPiece;
-        }
-        int channel = (t - 1) + (tcolorBlack ? 6 : 0);
-        base[tsq * 12 + channel] = 1.0f;
-    }
-
+    pushHistory(fen);
     NSError *err = nil;
     MLMultiArray *arr = [[MLMultiArray alloc] initWithShape:@[@1, @64, @96]
                                                    dataType:MLMultiArrayDataTypeFloat32
-                                                      error:&err];
+                                                        error:&err];
     if (!arr) return nil;
     float *dst = (float *)arr.dataPointer;
-    for (int sqi = 0; sqi < 64; sqi++)
-        for (int f = 0; f < 8; f++)
-            for (int ch = 0; ch < 12; ch++)
-                dst[sqi * 96 + f * 12 + ch] = base[sqi * 12 + ch];
+    memset(dst, 0, 64 * 96 * sizeof(float));
+
+    int have = (int)gHist.size();
+    if (have > kHistPlanes) have = kHistPlanes;
+    int first = (int)gHist.size() - have;
+
+    for (int f = 0; f < kHistPlanes; f++) {
+        int rel = have - kHistPlanes + f;
+        if (rel < 0) rel = 0;
+        char board[64];
+        int sbDummy = 0;
+        parseFenBoard(gHist[first + rel].c_str(), board, &sbDummy);
+        for (int sq = 0; sq < 64; sq++) {
+            char c = board[sq];
+            if (!c) continue;
+            int t = pieceType(c);
+            if (!t) continue;
+            int isBlackPiece = (c >= 'a' && c <= 'z') ? 1 : 0;
+            int tsq = sideBlack ? (sq ^ 56) : sq;
+            int ch = (t - 1) + ((isBlackPiece ^ sideBlack) ? 6 : 0);
+            dst[tsq * 96 + f * 12 + ch] = 1.0f;
+        }
+    }
     return arr;
 }
 
@@ -151,7 +163,7 @@ static MLMultiArray *scalarInt32(int v) {
     NSError *err = nil;
     MLMultiArray *a = [[MLMultiArray alloc] initWithShape:@[@1]
                                                  dataType:MLMultiArrayDataTypeInt32
-                                                    error:&err];
+                                                      error:&err];
     if (!a) return nil;
     ((int32_t *)a.dataPointer)[0] = (int32_t)v;
     return a;
@@ -160,16 +172,13 @@ static MLMultiArray *scalarInt32(int v) {
 extern "C" bool MaiaLoad(const char *mlpackagePath) {
     if (gMaiaModel) return true;
     buildMoveTables();
-
     @autoreleasepool {
         NSString *path = [NSString stringWithUTF8String:mlpackagePath];
         NSURL *url = [NSURL fileURLWithPath:path];
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return false;
-
         NSError *err = nil;
         NSURL *compiled = [MLModel compileModelAtURL:url error:&err];
         if (!compiled || err) return false;
-
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
         cfg.computeUnits = MLComputeUnitsCPUOnly;
         MLModel *m = [MLModel modelWithContentsOfURL:compiled configuration:cfg error:&err];
@@ -189,7 +198,6 @@ static bool MaiaLoadFromDir(NSString *dir) {
         NSURL *url = [NSURL fileURLWithPath:dir];
         NSURL *compiled = [MLModel compileModelAtURL:url error:&err];
         if (!compiled || err) return false;
-
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
         cfg.computeUnits = MLComputeUnitsCPUOnly;
         MLModel *m = [MLModel modelWithContentsOfURL:compiled configuration:cfg error:&err];
@@ -199,17 +207,15 @@ static bool MaiaLoadFromDir(NSString *dir) {
     return gMaiaModel != nil;
 }
 
-// Reconstruct the mlpackage from sections embedded in our own dylib and load it
-// from the app's temp dir — works even when the app sandbox can't read /var/jb.
+// Rebuild the mlpackage from sections embedded in our own dylib and load it
+// from the temp dir.
 extern "C" bool MaiaLoadEmbedded(void) {
     if (gMaiaModel) return true;
     buildMoveTables();
-
     @autoreleasepool {
         Dl_info info;
         if (!dladdr((void *)&MaiaLoadEmbedded, &info) || !info.dli_fbase) return false;
         const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
-
         unsigned long mfLen = 0, mdLen = 0, wLen = 0;
         uint8_t *mf = (uint8_t *)getsectiondata(mh, "__TEXT", "__maia_mfst", &mfLen);
         uint8_t *md = (uint8_t *)getsectiondata(mh, "__TEXT", "__maia_model", &mdLen);
@@ -219,20 +225,19 @@ extern "C" bool MaiaLoadEmbedded(void) {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"maia3_5m.mlpackage"];
         [fm removeItemAtPath:dir error:nil];
-
         NSString *weightsDir = [dir stringByAppendingPathComponent:@"Data/com.apple.CoreML/weights"];
-        if (![fm createDirectoryAtPath:weightsDir withIntermediateDirectories:YES attributes:nil error:nil])
-            return false;
-
+        if (![fm createDirectoryAtPath:weightsDir withIntermediateDirectories:YES attributes:nil error:nil]) return false;
         BOOL ok = [fm createFileAtPath:[dir stringByAppendingPathComponent:@"Manifest.json"]
-                              contents:[NSData dataWithBytes:mf length:mfLen] attributes:nil];
+                              contents:[NSData dataWithBytes:mf length:mfLen]
+                            attributes:nil];
         ok = ok && [fm createFileAtPath:[[dir stringByAppendingPathComponent:@"Data/com.apple.CoreML"]
-                                         stringByAppendingPathComponent:@"model.mlmodel"]
-                               contents:[NSData dataWithBytes:md length:mdLen] attributes:nil];
+                                            stringByAppendingPathComponent:@"model.mlmodel"]
+                                contents:[NSData dataWithBytes:md length:mdLen]
+                              attributes:nil];
         ok = ok && [fm createFileAtPath:[weightsDir stringByAppendingPathComponent:@"weight.bin"]
-                               contents:[NSData dataWithBytes:wg length:wLen] attributes:nil];
+                                contents:[NSData dataWithBytes:wg length:wLen]
+                              attributes:nil];
         if (!ok) return false;
-
         return MaiaLoadFromDir(dir);
     }
 }
@@ -241,23 +246,19 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
     MaiaResult res;
     memset(&res, 0, sizeof(res));
     res.ok = false;
-
     if (!gMaiaModel) { if (done) done(res); return; }
 
     maybeRollForm(fen);
 
     int modelElo = selfElo - kEloOffset;
-    if (modelElo < 600)  modelElo = 600;
+    if (modelElo < 600) modelElo = 600;
     if (modelElo > 2600) modelElo = 2600;
     int modelOppo = oppoElo - kEloOffset;
-    if (modelOppo < 600)  modelOppo = 600;
+    if (modelOppo < 600) modelOppo = 600;
     if (modelOppo > 2600) modelOppo = 2600;
 
-    std::string fenStr(fen);
     int sideBlack = 0;
-    {
-        char b[64]; parseFenBoard(fen, b, &sideBlack);
-    }
+    { char b[64]; parseFenBoard(fen, b, &sideBlack); }
 
     char legalBuf[256 * 6];
     int legalCount = StockfishLegalMoves(fen, legalBuf, 256);
@@ -275,15 +276,11 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
             @"oppo_elo": [MLFeatureValue featureValueWithMultiArray:oe],
         };
         NSError *err = nil;
-        MLDictionaryFeatureProvider *prov =
-            [[MLDictionaryFeatureProvider alloc] initWithDictionary:feats error:&err];
+        MLDictionaryFeatureProvider *prov = [[MLDictionaryFeatureProvider alloc] initWithDictionary:feats error:&err];
         if (!prov || err) { if (done) done(res); return; }
 
         id<MLFeatureProvider> out = [gMaiaModel predictionFromFeatures:prov error:&err];
-        if (!out || err) {
-            if (done) done(res);
-            return;
-        }
+        if (!out || err) { if (done) done(res); return; }
 
         MLMultiArray *moveLogits = [out featureValueForName:@"move_logits"].multiArrayValue;
         MLMultiArray *valueLogits = [out featureValueForName:@"value_logits"].multiArrayValue;
@@ -297,7 +294,7 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
             auto it = gMoveIdx.find(modelUci);
             if (it == gMoveIdx.end()) continue;
             double v = [[moveLogits objectAtIndexedSubscript:it->second] doubleValue];
-            cands.push_back({v, uci});
+            cands.push_back({v, uci, 0.0});
         }
         if (cands.empty()) { if (done) done(res); return; }
 
@@ -306,52 +303,40 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
 
         int total = (int)cands.size();
 
-        // Lower elo -> flatter distribution and a wider candidate pool.
-        double eF = (double)(modelElo - 600) / 2000.0;
-        if (eF < 0.0) eF = 0.0;
-        if (eF > 1.0) eF = 1.0;
+        // Temperature stays at 1.0 so the sampled distribution is the model's
+        // own. Cold form loosens it slightly, openings a touch more.
+        double T = kTempScale * (1.0 + 0.15 * -gForm);
+        if (gPly <= 8) T = 1.15;
+        if (T < 0.05) T = 0.05;
 
-        double T = kTempMax - (kTempMax - kTempMin) * eF;
-        T *= (1.0 + 0.24 * -gForm);   // cold games play looser
-
-        int k = 3 + (2600 - modelElo) / 120 + (int)lround(-gForm * 2.0);
-        if (k < 2) k = 2;
-        if (k > total) k = total;
-
-        // Openings: widen the funnel so mainlines vary game to game.
-        if (fenFullmove(fen) <= 10) {
-            if (k < 6) k = 6;
-            if (k > total) k = total;
-            T += 0.30;
-        }
-
-        for (int i = 0; i < total; i++) cands[i].prob = 0.0;
-        double mx = cands[0].logit / T, sum = 0;
-        for (int i = 0; i < k; i++) {
-            cands[i].prob = exp(cands[i].logit / T - mx);
+        double mx = cands[0].logit, sum = 0;
+        for (int i = 0; i < total; i++) {
+            cands[i].prob = exp((cands[i].logit - mx) / T);
             sum += cands[i].prob;
         }
-        for (int i = 0; i < k; i++) cands[i].prob /= sum;
+        if (sum <= 0) sum = 1.0;
+        for (int i = 0; i < total; i++) cands[i].prob /= sum;
+
+#if MAIA_DEBUG_DIST
+        NSMutableString *dbg = [NSMutableString string];
+        int dn = total < 6 ? total : 6;
+        for (int i = 0; i < dn; i++)
+            [dbg appendFormat:@"%s=%.3f(%.2f) ", cands[i].uci.c_str(), cands[i].prob, cands[i].logit];
+        NSLog(@"maia elo=%d ply=%d form=%.2f T=%.2f n=%d :: %@",
+              modelElo, gPly, gForm, T, total, dbg);
+#endif
 
         int pick = 0;
         double r = (double)arc4random_uniform(1000000) / 1000000.0, acc = 0;
-        for (int i = 0; i < k; i++) {
+        for (int i = 0; i < total; i++) {
             acc += cands[i].prob;
             if (r <= acc) { pick = i; break; }
         }
-
-        // Occasional genuine inaccuracy from the tier just below the cut.
-        double q = kBlunderMax - (kBlunderMax - kBlunderMin) * eF;
-        if (gForm < -0.4) q += 0.07;
-        if (total > k && ((double)arc4random_uniform(10000) / 10000.0) < q) {
-            int hi = total - 1;
-            if (hi > 2 * k) hi = 2 * k;
-            pick = k + (int)arc4random_uniform(hi - k + 1);
-        }
-
+        if (pick >= total) pick = total - 1;
         if (pick > 0) std::rotate(cands.begin(), cands.begin() + pick, cands.begin() + pick + 1);
 
-        int n = total; if (n > 4) n = 4;
+        int n = total;
+        if (n > 4) n = 4;
         res.count = n;
         for (int i = 0; i < n; i++) {
             std::strncpy(res.moves[i], cands[i].uci.c_str(), 7);
@@ -369,8 +354,8 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
             l[2] = [[valueLogits objectAtIndexedSubscript:2] doubleValue];
             double vmx = fmax(l[0], fmax(l[1], l[2]));
             double e0 = exp(l[0] - vmx), e1 = exp(l[1] - vmx), e2 = exp(l[2] - vmx);
-            double s = e0 + e1 + e2;
-            double lossP = e0 / s, winP = e2 / s;
+            double s2 = e0 + e1 + e2;
+            double lossP = e0 / s2, winP = e2 / s2;
             res.winPct = winP * 100.0;
             stmScore = (winP - lossP) * 4.0;
         }
