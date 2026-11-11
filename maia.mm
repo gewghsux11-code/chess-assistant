@@ -118,6 +118,15 @@ static void pushHistory(const char *fen) {
   gPly++;
 }
 
+// Record a ply without running inference. The host only calls MaiaGo on our own
+// turn, so without this the ring is every other ply and every frame shares the
+// current side to move.
+extern "C" void MaiaNotePly(const char *fen) {
+  if (!fen) return;
+  maybeRollForm(fen);
+  pushHistory(fen);
+}
+
 static int pieceType(char c) {
   switch (c) {
   case 'P': case 'p': return 1;
@@ -339,10 +348,10 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
 
     int total = (int)cands.size();
 
-    // Temperature stays at 1.0 so the sampled distribution is the model's
-    // own. Cold form loosens it slightly, openings a touch more.
+    // Reference sampler: softmax over the full masked vocabulary at flat 1.0.
+    // No form term, no opening boost.
     double T = kTempScale;
-if (T < 0.05) T = 0.05;
+    if (T < 0.05) T = 0.05;
 
     double mx = cands[0].logit, sum = 0;
     for (int i = 0; i < total; i++) {
