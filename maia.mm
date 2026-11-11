@@ -1,5 +1,8 @@
 #import "maia.h"
 #import "engine.h"
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #import <CoreML/CoreML.h>
 #import <dlfcn.h>
 #import <mach-o/getsect.h>
@@ -7,6 +10,15 @@
 #import <string>
 #import <unordered_map>
 #import <algorithm>
+
+// ---- strength settings ----
+static const int    kEloOffset   = 200;   // Maia/Lichess ratings run above chess.com
+static const double kTempMax     = 1.45;  // temperature at 600 elo
+static const double kTempMin     = 1.05;  // temperature at 2600 elo
+static const double kBlunderMax  = 0.18;  // deliberate-inaccuracy rate at 600 elo
+static const double kBlunderMin  = 0.06;  // deliberate-inaccuracy rate at 2600 elo
+
+static double gForm = 0.0;                // -1 cold game .. +1 hot game
 
 static MLModel *gMaiaModel = nil;
 static std::vector<std::string> gMoves;
@@ -64,6 +76,23 @@ static bool parseFenBoard(const char *fen, char board[64], int *sideBlack) {
     while (*p == ' ') p++;
     *sideBlack = (*p == 'b') ? 1 : 0;
     return true;
+}
+
+static int fenFullmove(const char *fen) {
+    const char *p = fen;
+    int spaces = 0;
+    while (*p && spaces < 5) { if (*p == ' ') spaces++; p++; }
+    int n = atoi(p);
+    return n > 0 ? n : 1;
+}
+
+// Roll a fresh form value once per game, on the first suggestion request.
+static void maybeRollForm(const char *fen) {
+    static char last[128] = {0};
+    if (fenFullmove(fen) != 1) return;
+    if (strcmp(last, fen) == 0) return;
+    strncpy(last, fen, sizeof(last) - 1);
+    gForm = ((double)arc4random_uniform(1000) / 1000.0) * 2.0 - 1.0;
 }
 
 static int pieceType(char c) {
@@ -210,12 +239,19 @@ extern "C" bool MaiaLoadEmbedded(void) {
 
 extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBlock done) {
     MaiaResult res;
-    res.move[0] = '\0';
-    res.winPct = 0;
-    res.whiteEval = 0;
+    memset(&res, 0, sizeof(res));
     res.ok = false;
 
     if (!gMaiaModel) { if (done) done(res); return; }
+
+    maybeRollForm(fen);
+
+    int modelElo = selfElo - kEloOffset;
+    if (modelElo < 600)  modelElo = 600;
+    if (modelElo > 2600) modelElo = 2600;
+    int modelOppo = oppoElo - kEloOffset;
+    if (modelOppo < 600)  modelOppo = 600;
+    if (modelOppo > 2600) modelOppo = 2600;
 
     std::string fenStr(fen);
     int sideBlack = 0;
@@ -229,8 +265,8 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
 
     @autoreleasepool {
         MLMultiArray *tokens = buildTokens(fen, sideBlack);
-        MLMultiArray *se = scalarInt32(selfElo);
-        MLMultiArray *oe = scalarInt32(oppoElo);
+        MLMultiArray *se = scalarInt32(modelElo);
+        MLMultiArray *oe = scalarInt32(modelOppo);
         if (!tokens || !se || !oe) { if (done) done(res); return; }
 
         NSDictionary *feats = @{
@@ -268,29 +304,59 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
         std::sort(cands.begin(), cands.end(),
                   [](const Cand &a, const Cand &b) { return a.logit > b.logit; });
 
-        double T = 0.5;
-        double mx = cands[0].logit / T, sum = 0;
-        for (auto &c : cands) sum += exp(c.logit / T - mx);
-        for (auto &c : cands) c.prob = exp(c.logit / T - mx) / sum;
-
         int total = (int)cands.size();
-        int pick = 0;
-        if (total > 1) {
-            double r = (double)arc4random_uniform(1000000) / 1000000.0;
-            double acc = 0;
-            for (int i = 0; i < total; i++) {
-                acc += cands[i].prob;
-                if (r <= acc) { pick = i; break; }
-            }
+
+        // Lower elo -> flatter distribution and a wider candidate pool.
+        double eF = (double)(modelElo - 600) / 2000.0;
+        if (eF < 0.0) eF = 0.0;
+        if (eF > 1.0) eF = 1.0;
+
+        double T = kTempMax - (kTempMax - kTempMin) * eF;
+        T *= (1.0 + 0.24 * -gForm);   // cold games play looser
+
+        int k = 3 + (2600 - modelElo) / 120 + (int)lround(-gForm * 2.0);
+        if (k < 2) k = 2;
+        if (k > total) k = total;
+
+        // Openings: widen the funnel so mainlines vary game to game.
+        if (fenFullmove(fen) <= 10) {
+            if (k < 6) k = 6;
+            if (k > total) k = total;
+            T += 0.30;
         }
+
+        for (int i = 0; i < total; i++) cands[i].prob = 0.0;
+        double mx = cands[0].logit / T, sum = 0;
+        for (int i = 0; i < k; i++) {
+            cands[i].prob = exp(cands[i].logit / T - mx);
+            sum += cands[i].prob;
+        }
+        for (int i = 0; i < k; i++) cands[i].prob /= sum;
+
+        int pick = 0;
+        double r = (double)arc4random_uniform(1000000) / 1000000.0, acc = 0;
+        for (int i = 0; i < k; i++) {
+            acc += cands[i].prob;
+            if (r <= acc) { pick = i; break; }
+        }
+
+        // Occasional genuine inaccuracy from the tier just below the cut.
+        double q = kBlunderMax - (kBlunderMax - kBlunderMin) * eF;
+        if (gForm < -0.4) q += 0.07;
+        if (total > k && ((double)arc4random_uniform(10000) / 10000.0) < q) {
+            int hi = total - 1;
+            if (hi > 2 * k) hi = 2 * k;
+            pick = k + (int)arc4random_uniform(hi - k + 1);
+        }
+
         if (pick > 0) std::rotate(cands.begin(), cands.begin() + pick, cands.begin() + pick + 1);
 
         int n = total; if (n > 4) n = 4;
         res.count = n;
-        for (int k = 0; k < n; k++) {
-            std::strncpy(res.moves[k], cands[k].uci.c_str(), 7);
-            res.moves[k][7] = '\0';
-            res.policy[k] = cands[k].prob;
+        for (int i = 0; i < n; i++) {
+            std::strncpy(res.moves[i], cands[i].uci.c_str(), 7);
+            res.moves[i][7] = '\0';
+            res.policy[i] = cands[i].prob;
         }
         std::strncpy(res.move, cands[0].uci.c_str(), 7);
         res.move[7] = '\0';
@@ -301,8 +367,8 @@ extern "C" void MaiaGo(const char *fen, int selfElo, int oppoElo, MaiaResultBloc
             l[0] = [[valueLogits objectAtIndexedSubscript:0] doubleValue];
             l[1] = [[valueLogits objectAtIndexedSubscript:1] doubleValue];
             l[2] = [[valueLogits objectAtIndexedSubscript:2] doubleValue];
-            double mx = fmax(l[0], fmax(l[1], l[2]));
-            double e0 = exp(l[0] - mx), e1 = exp(l[1] - mx), e2 = exp(l[2] - mx);
+            double vmx = fmax(l[0], fmax(l[1], l[2]));
+            double e0 = exp(l[0] - vmx), e1 = exp(l[1] - vmx), e2 = exp(l[2] - vmx);
             double s = e0 + e1 + e2;
             double lossP = e0 / s, winP = e2 / s;
             res.winPct = winP * 100.0;
