@@ -1521,11 +1521,11 @@ static void clampGeloToActiveRange(void) {
         [_stack addArrangedSubview:[self sectionLabel:@"Features"]];
 
         NSMutableArray *swRows = [NSMutableArray array];
-        [swRows addObject:[self rowTitle:@"Move Analysis" control:[self switchOn:gTrackQuality sel:@selector(swAnalysis:)]];
+        [swRows addObject:[self rowTitle:@"Move Analysis" control:[self switchOn:gTrackQuality sel:@selector(swAnalysis:)]]];
         [swRows addObject:[self sep]];
-        [swRows addObject:[self rowTitle:@"Eval Labels" control:[self switchOn:gShowEvalLabels sel:@selector(swLabels:)]];
+        [swRows addObject:[self rowTitle:@"Eval Labels" control:[self switchOn:gShowEvalLabels sel:@selector(swLabels:)]]];
         [swRows addObject:[self sep]];
-        [swRows addObject:[self rowTitle:@"Color by Eval" control:[self switchOn:gArrowEvalColor sel:@selector(swColor:)]];
+        [swRows addObject:[self rowTitle:@"Color by Eval" control:[self switchOn:gArrowEvalColor sel:@selector(swColor:)]]];
         UIStackView *sw = [[UIStackView alloc] initWithArrangedSubviews:swRows];
         sw.axis = UILayoutConstraintAxisVertical; sw.spacing = 14;
         [_stack addArrangedSubview:[self group:sw]];
