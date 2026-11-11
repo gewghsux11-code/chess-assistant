@@ -8,6 +8,8 @@
 #import "engine.h"
 #import "maia.h"
 
+extern "C" void MaiaNotePly(const char *fen);
+
 #define CH_ACCENT [UIColor colorWithRed:0.49 green:0.66 blue:0.32 alpha:1.0]
 
 #define PREF_ELO     @"ChessAssist_ELO"
@@ -1519,11 +1521,11 @@ static void clampGeloToActiveRange(void) {
         [_stack addArrangedSubview:[self sectionLabel:@"Features"]];
 
         NSMutableArray *swRows = [NSMutableArray array];
-        [swRows addObject:[self rowTitle:@"Move Analysis" control:[self switchOn:gTrackQuality sel:@selector(swAnalysis:)]]];
+        [swRows addObject:[self rowTitle:@"Move Analysis" control:[self switchOn:gTrackQuality sel:@selector(swAnalysis:)]];
         [swRows addObject:[self sep]];
-        [swRows addObject:[self rowTitle:@"Eval Labels" control:[self switchOn:gShowEvalLabels sel:@selector(swLabels:)]]];
+        [swRows addObject:[self rowTitle:@"Eval Labels" control:[self switchOn:gShowEvalLabels sel:@selector(swLabels:)]];
         [swRows addObject:[self sep]];
-        [swRows addObject:[self rowTitle:@"Color by Eval" control:[self switchOn:gArrowEvalColor sel:@selector(swColor:)]]];
+        [swRows addObject:[self rowTitle:@"Color by Eval" control:[self switchOn:gArrowEvalColor sel:@selector(swColor:)]];
         UIStackView *sw = [[UIStackView alloc] initWithArrangedSubviews:swRows];
         sw.axis = UILayoutConstraintAxisVertical; sw.spacing = 14;
         [_stack addArrangedSubview:[self group:sw]];
@@ -2732,6 +2734,7 @@ static void enginePollTick(void) {
                     } else {
                         clearArrow();
                         analyzeUserMove(fen);
+                        MaiaNotePly([fen UTF8String]);
                     }
                 }
             }
@@ -2746,7 +2749,7 @@ static void enginePollTick(void) {
             gLastEngineFEN = [sfn copy];
             parseFEN(sfn);
 
-            if (gMyColor >= 0 && gMyColor != gSide) { analyzeUserMove(sfn); return; }
+            if (gMyColor >= 0 && gMyColor != gSide) { analyzeUserMove(sfn); MaiaNotePly([sfn UTF8String]); return; }
 
             dbg([NSString stringWithFormat:@"SWIFT FEN: %@",
                  [sfn substringToIndex:MIN(sfn.length, 55)]]);
@@ -2771,7 +2774,7 @@ static void enginePollTick(void) {
                 gLastEngineFEN = [decoded copy];
                 parseFEN(decoded);
 
-                if (gMyColor >= 0 && gMyColor != gSide) { analyzeUserMove(decoded); return; }
+                if (gMyColor >= 0 && gMyColor != gSide) { analyzeUserMove(decoded); MaiaNotePly([decoded UTF8String]); return; }
 
                 dbg([NSString stringWithFormat:@"SWIFT TCN→FEN: %@",
                      [decoded substringToIndex:MIN(decoded.length, 55)]]);
@@ -3128,6 +3131,7 @@ static BOOL processBotBoard(UIView *board) {
     } else {
         clearArrow();
         analyzeUserMove(fen);
+        MaiaNotePly([fen UTF8String]);
     }
     return YES;
 }
@@ -3576,6 +3580,7 @@ static void hook_layoutSubviews(id self, SEL _cmd) {
 
             if (gMyColor >= 0 && gMyColor != gSide) {
 
+                MaiaNotePly([currentFEN UTF8String]);
                 dispatch_async(dispatch_get_main_queue(), ^{ clearArrow(); });
                 return;
             }
@@ -3610,7 +3615,7 @@ static void hook_setEncodedMoves(id self, SEL _cmd, NSString *encoded) {
         NSString *currentFEN = decodeTCNToFEN(initialFEN, encoded);
         if (currentFEN.length) {
             parseFEN(currentFEN);
-            if (gMyColor >= 0 && gMyColor != gSide) return;
+            if (gMyColor >= 0 && gMyColor != gSide) { MaiaNotePly([currentFEN UTF8String]); return; }
             dbg([NSString stringWithFormat:@"FEN(setter): %@", [currentFEN substringToIndex:MIN(currentFEN.length, 55)]]);
             gForcedFlip = -1;
             dispatch_async(dispatch_get_main_queue(), ^{ fetchMove(currentFEN); });
